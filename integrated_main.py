@@ -12,6 +12,9 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.image import MIMEImage
 from email.mime.text import MIMEText
 
+# Thư viện dành riêng cho Pi Camera Module 3
+from picamera2 import Picamera2
+
 # Thư viện cho Cảm biến phần cứng (Từ source của bạn)
 from ml_predictor import predict_hazard
 from DS18B20_Temperature_Sensor import get_temperature_data
@@ -60,7 +63,6 @@ def send_email(frame, max_retries=3, delay=5):
 
             body = f"""THÔNG BÁO: HỆ THỐNG PHÁT HIỆN SỰ CỐ!
 Hệ thống báo cháy đã phát hiện dấu hiệu hỏa hoạn/khói vào thời điểm: {time_str}.
-
 Bạn vui lòng gọi ngay cho Cảnh sát PCCC Thành phố Hồ Chí Minh theo thông báo sau:
 - Số điện thoại báo cháy: 114
 - Số điện thoại đường dây nóng: (028) 39 200 996
@@ -184,10 +186,18 @@ if __name__ == "__main__":
     sensor_thread = threading.Thread(target=sensor_worker, daemon=True)
     sensor_thread.start()
 
-    # 2. Khởi tạo AI
+    # 2. Khởi tạo AI YOLOv11
     model = YOLO("best.pt")
     names = model.model.names
-    cap = cv2.VideoCapture(0)
+    
+    # 3. KHỞI TẠO PI CAMERA MODULE 3 BẰNG PICAMERA2
+    print("📷 Đang khởi tạo Pi Camera Module 3...")
+    picam2 = Picamera2()
+    # Yêu cầu Picamera2 trả về mảng BGR888 để tương thích trực tiếp với OpenCV
+    config = picam2.create_preview_configuration(main={"size": (1020, 500), "format": "BGR888"})
+    picam2.configure(config)
+    picam2.start()
+
     count = 0
 
     CONFIDENCE_THRESHOLD = 0.6  
@@ -204,71 +214,79 @@ if __name__ == "__main__":
 
     print("🚀 HỆ THỐNG TÍCH HỢP AI & HARDWARE BẮT ĐẦU HOẠT ĐỘNG...")
 
-    while True:
-        ret, frame = cap.read()
-        if not ret: break
-
-        count += 1
-        if count % 2 != 0: continue
-        frame = cv2.resize(frame, (1020, 500))
-
-        results = model.track(frame, persist=True, conf=CONFIDENCE_THRESHOLD, verbose=False)
-        fire_in_current_frame = False
-
-        if results[0].boxes is not None:
-            boxes = results[0].boxes.xyxy.int().cpu().tolist()
-            class_ids = results[0].boxes.cls.int().cpu().tolist()
-            track_ids = results[0].boxes.id.int().cpu().tolist() if results[0].boxes.id is not None else [-1] * len(boxes)
-            masks = results[0].masks.xy if results[0].masks is not None else []
-            overlay = frame.copy()
-
-            for box, track_id, class_id, mask in zip(boxes, track_ids, class_ids, masks):
-                c = names[class_id]
-                x1, y1, x2, y2 = box
-                area = (x2 - x1) * (y2 - y1)
-                
-                if area < MIN_AREA or area > MAX_AREA: continue  
-
-                if len(mask) > 0:
-                    mask_arr = np.array(mask, dtype=np.int32).reshape((-1, 1, 2)) 
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.fillPoly(overlay, [mask_arr], color=(0, 0, 255))
-                    cvzone.putTextRect(frame, f'{c} {track_id}', (x1, y1), 1, 1)
-
-                    if c in ['fire', 'smoke']:
-                        fire_in_current_frame = True
-
-            frame = cv2.addWeighted(overlay, 0.5, frame, 0.5, 0)
-
-        # LOGIC THỜI GIAN 10 GIÂY
-        current_time = time.time()
-        if fire_in_current_frame:
-            if first_fire_time == 0.0: first_fire_time = current_time
-            last_fire_time = current_time 
-            elapsed_time = current_time - first_fire_time
+    try:
+        while True:
+            # Lấy khung hình trực tiếp từ Picamera2 (Thay cho cap.read() của OpenCV)
+            frame = picam2.capture_array()
             
-            cv2.putText(frame, f"Dang xac minh: {int(elapsed_time)}/10s", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 165, 255), 2)
+            if frame is None or frame.size == 0: 
+                print("❌ Lỗi mất tín hiệu Pi Camera 3!")
+                break
 
-            if elapsed_time >= REQUIRED_FIRE_TIME:
-                shared_state["yolo_fire_confirmed"] = True # Bật cờ cho Phần cứng kích Relay
+            count += 1
+            if count % 2 != 0: continue
+            
+            # Khung hình đã được resize từ lúc cấu hình Picamera2 nên không cần cv2.resize nữa, tiết kiệm CPU!
+            
+            results = model.track(frame, persist=True, conf=CONFIDENCE_THRESHOLD, verbose=False)
+            fire_in_current_frame = False
+
+            if results[0].boxes is not None:
+                boxes = results[0].boxes.xyxy.int().cpu().tolist()
+                class_ids = results[0].boxes.cls.int().cpu().tolist()
+                track_ids = results[0].boxes.id.int().cpu().tolist() if results[0].boxes.id is not None else [-1] * len(boxes)
+                masks = results[0].masks.xy if results[0].masks is not None else []
+                overlay = frame.copy()
+
+                for box, track_id, class_id, mask in zip(boxes, track_ids, class_ids, masks):
+                    c = names[class_id]
+                    x1, y1, x2, y2 = box
+                    area = (x2 - x1) * (y2 - y1)
+                    
+                    if area < MIN_AREA or area > MAX_AREA: continue  
+
+                    if len(mask) > 0:
+                        mask_arr = np.array(mask, dtype=np.int32).reshape((-1, 1, 2)) 
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        cv2.fillPoly(overlay, [mask_arr], color=(0, 0, 255))
+                        cvzone.putTextRect(frame, f'{c} {track_id}', (x1, y1), 1, 1)
+
+                        if c in ['fire', 'smoke']:
+                            fire_in_current_frame = True
+
+                frame = cv2.addWeighted(overlay, 0.5, frame, 0.5, 0)
+
+            # LOGIC THỜI GIAN 10 GIÂY
+            current_time = time.time()
+            if fire_in_current_frame:
+                if first_fire_time == 0.0: first_fire_time = current_time
+                last_fire_time = current_time 
+                elapsed_time = current_time - first_fire_time
                 
-                if current_time - last_email_time > EMAIL_COOLDOWN:
-                    threading.Thread(target=send_email, args=(frame.copy(),), daemon=True).start()
-                    last_email_time = current_time
-                    first_fire_time = 0.0 
-        else:
-            if first_fire_time != 0.0:
-                if current_time - last_fire_time > TOLERANCE_TIME:
-                    first_fire_time = 0.0
-                    shared_state["yolo_fire_confirmed"] = False # Tắt cờ khi lửa tắt
+                cv2.putText(frame, f"Dang xac minh: {int(elapsed_time)}/10s", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 165, 255), 2)
 
-        # HIỂN THỊ THÔNG SỐ CẢM BIẾN LÊN MÀN HÌNH CAMERA (GIAO TIẾP 2 CHIỀU)
-        cv2.putText(frame, f"Temp: {shared_state['current_temp']} C | VOC: {shared_state['current_voc']} ppm", (20, 480), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        if shared_state["sensor_fire_confirmed"]:
-            cv2.putText(frame, "SENSORS DETECTED HAZARD!", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+                if elapsed_time >= REQUIRED_FIRE_TIME:
+                    shared_state["yolo_fire_confirmed"] = True # Bật cờ cho Phần cứng kích Relay
+                    
+                    if current_time - last_email_time > EMAIL_COOLDOWN:
+                        threading.Thread(target=send_email, args=(frame.copy(),), daemon=True).start()
+                        last_email_time = current_time
+                        first_fire_time = 0.0 
+            else:
+                if first_fire_time != 0.0:
+                    if current_time - last_fire_time > TOLERANCE_TIME:
+                        first_fire_time = 0.0
+                        shared_state["yolo_fire_confirmed"] = False # Tắt cờ khi lửa tắt
 
-        cv2.imshow("HETHONG PCCC - YOLOV11 + HARDWARE", frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"): break
+            # HIỂN THỊ THÔNG SỐ CẢM BIẾN LÊN MÀN HÌNH CAMERA (GIAO TIẾP 2 CHIỀU)
+            cv2.putText(frame, f"Temp: {shared_state['current_temp']} C | VOC: {shared_state['current_voc']} ppm", (20, 480), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            if shared_state["sensor_fire_confirmed"]:
+                cv2.putText(frame, "SENSORS DETECTED HAZARD!", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
 
-    cap.release()
-    cv2.destroyAllWindows()
+            cv2.imshow("HETHONG PCCC - YOLOV11 + HARDWARE", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"): break
+
+    finally:
+        # Giải phóng tài nguyên camera thay vì cap.release()
+        picam2.stop()
+        cv2.destroyAllWindows()
