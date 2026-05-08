@@ -4,7 +4,6 @@ import sys
 import os
 
 # ================= CẤU HÌNH ĐƯỜNG DẪN =================
-# Bạn hãy kiểm tra lại xem đường dẫn này đã khớp chính xác với máy bạn chưa nhé
 PYTHON_PATH = "/home/pi/env_pccc/bin/python"
 PROJECT_DIR = "/home/pi/Desktop/Main_Project_Code_Python"
 
@@ -16,8 +15,9 @@ def start_system():
     print("🚀 ĐANG KHỞI CHẠY HỆ THỐNG PCCC ĐA TIẾN TRÌNH (MULTI-PROCESS)")
     print("="*65)
 
-    # 1. Cấp quyền hiển thị màn hình (Fix lỗi OpenCV xcb)
+    # 1. Cấp quyền hiển thị màn hình (Fix triệt để lỗi OpenCV trên Pi 5)
     os.environ["DISPLAY"] = ":0"
+    os.environ["QT_QPA_PLATFORM"] = "xcb" # Bảo vệ kép cho cửa sổ VNC
 
     # 2. Khởi tạo/Reset file trạng thái trên RAM về 0 (An toàn)
     try:
@@ -27,11 +27,11 @@ def start_system():
         print(f"⚠️ Không thể tạo file trạng thái RAM: {e}")
 
     # 3. Kích hoạt tiến trình Camera & AI (YOLO)
-    print("⏳ Đang bật Camera và tải mô hình YOLO...")
+    print("⏳ Đang bật Camera và tải mô hình YOLO (Cần khoảng 8s)...")
     proc_vision = subprocess.Popen([PYTHON_PATH, FILE_VISION])
     
-    # Đợi 3 giây để Camera khởi động xong và ổn định khung hình
-    time.sleep(3) 
+    # Đợi 8 giây để AI Load xong bộ não vào RAM và hiện cửa sổ Camera lên trước
+    time.sleep(8) 
 
     # 4. Kích hoạt tiến trình Cảm biến & E-Ra
     print("⏳ Đang bật Cảm biến phần cứng và Kết nối MQTT...")

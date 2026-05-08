@@ -1,5 +1,7 @@
 import time, json, os, csv
 from datetime import datetime
+import smtplib
+from email.mime.text import MIMEText
 
 from ml_predictor import predict_hazard
 from DS18B20_Temperature_Sensor import get_temperature_data
@@ -18,6 +20,28 @@ def get_yolo_status():
             with open(STATUS_FILE, "r") as f: return f.read().strip() == "1"
     except: return False
     return False
+
+# ================= HÀM GỬI EMAIL CẢNH BÁO =================
+def send_alert_email(subject, body):
+    try:
+        # Nhớ trỏ đường dẫn tuyệt đối để chạy ngầm không bị lỗi
+        with open('/home/pi/Desktop/Main_Project_Code_Python/emailpass.txt', 'r') as f:
+            lines = f.read().splitlines()
+            sender_email = lines[0]
+            password = lines[1]
+            receiver_email = lines[2]
+
+        msg = MIMEText(body)
+        msg['Subject'] = subject
+        msg['From'] = sender_email
+        msg['To'] = receiver_email
+
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(sender_email, password)
+            server.send_message(msg)
+        print(" 📧 [THÀNH CÔNG] Đã gửi Email cảnh báo đến chủ nhà!")
+    except Exception as e:
+        print(f" ⚠️ [LỖI] Không thể gửi Email: {e}")
 
 # ================= TEMPORAL FILTER =================
 temporal_filter = TemporalConfirmation(
@@ -52,6 +76,11 @@ if not csv_exists:
         "ml_hazard", "fusion_hazard", "fusion_reason", 
         "yolo_status", "final_cross_decision" # 2 Cột bổ sung cho AI Camera
     ])
+
+# ================= EMAIL COOLDOWN SETUP =================
+last_gas_email_time = 0
+last_fire_email_time = 0
+EMAIL_COOLDOWN = 60 # Giới hạn: 60 giây mới gửi 1 mail cho cùng 1 sự kiện
 
 print("\n=== FIRE DETECTION SYSTEM – REALTIME CROSS-VERIFICATION MODE ===\n")
 
@@ -124,21 +153,44 @@ try:
 
         # Ma trận bù trừ chéo
         if yolo_fire and confirmed_hazard == "FIRE":
-            final_reason = "ĐỒNG THUẬN TUYỆT ĐỐI (AI + Hardware)"
+            final_reason = "ĐỒNG THUẬN TUYỆT ĐỐI (AI Camera + Cảm biến)"
             final_hazard = "FIRE"
             actuator.update({"buzzer": True, "mist": True, "emergency": True})
         elif yolo_fire and confirmed_hazard != "FIRE":
-            final_reason = "CAMERA BÁO TRƯỚC (Sensor chưa tới ngưỡng)"
+            final_reason = "CAMERA BÁO TRƯỚC (Cảm biến chưa tới ngưỡng)"
             final_hazard = "FIRE"
             actuator.update({"buzzer": True, "mist": True, "emergency": True})
         elif not yolo_fire and confirmed_hazard == "FIRE":
-            final_reason = "CẢM BIẾN BÁO CHÁY (Camera mù/bị che khuất)"
+            final_reason = "CẢM BIẾN BÁO CHÁY (Camera bị che khuất/điểm mù)"
             final_hazard = "FIRE"
             actuator.update({"buzzer": True, "mist": True, "emergency": True})
 
         # Thực thi Rơ-le với kết quả đã gộp
         write_actuators(actuator)
         final_relay_active = any(actuator.values())
+
+        # ==================================================
+        # ---------- KỊCH BẢN GỬI EMAIL CẢNH BÁO ----------
+        # ==================================================
+        current_time = time.time()
+
+        # 1. Kịch bản Rò rỉ khí GAS
+        if final_hazard == "GAS_LEAK" or confirmed_hazard == "GAS_LEAK":
+            if current_time - last_gas_email_time > EMAIL_COOLDOWN:
+                subject = "🚨 CẢNH BÁO KHẨN: RÒ RỈ KHÍ GAS 🚨"
+                body = f"Hệ thống phát hiện nồng độ khí Gas nguy hiểm trong khu vực!\n\nChi tiết:\n- Mức độ Gas (MQ-2): {mq2_hi}\n- Cảnh báo từ: Cảm biến phần cứng\n- Đã tự động kích hoạt Rơ-le an toàn.\n\nVui lòng kiểm tra hiện trường ngay lập tức!"
+                print(" ✉️ Phát hiện GAS - Đang gửi Email...")
+                send_alert_email(subject, body)
+                last_gas_email_time = current_time
+
+        # 2. Kịch bản Hỏa hoạn (Có so sánh chéo)
+        if final_hazard == "FIRE":
+            if current_time - last_fire_email_time > EMAIL_COOLDOWN:
+                subject = "🔥 CẢNH BÁO KHẨN CẤP: PHÁT HIỆN HỎA HOẠN 🔥"
+                body = f"Hệ thống giám sát vừa phát hiện sự cố HỎA HOẠN!\n\n=== ĐÁNH GIÁ CHÉO (CROSS-VERIFICATION) ===\n- KẾT LUẬN: {final_reason}\n- Tín hiệu Camera YOLO: {yolo_str}\n- Tín hiệu Cảm biến: {confirmed_hazard}\n\n=== THÔNG SỐ VẬT LÝ ===\n- Nhiệt độ: {temp_c}°C ({temp_status})\n- Khói (MQ-135): {mq135_hi}\n\nToàn bộ hệ thống chữa cháy đã được kích hoạt!"
+                print(" ✉️ Phát hiện LỬA - Đang gửi Email...")
+                send_alert_email(subject, body)
+                last_fire_email_time = current_time
 
         # ---------- JSONL LOG (ML INFERENCE) ----------
         ml_record = {
